@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	pb "github.com/jm96441n/raft/gen/go/raft/v1"
@@ -14,7 +15,7 @@ type server struct {
 	logger *slog.Logger
 
 	// leader specific
-	followers  []follower
+	followers  []*follower
 	leaderAddr pb.RaftClient
 	isLeader   bool
 
@@ -32,7 +33,7 @@ type follower struct {
 	nextIndex int
 }
 
-func NewServer(logger *slog.Logger, leaderAddr pb.RaftClient, followers []follower, envVars env) *server {
+func NewServer(logger *slog.Logger, leaderAddr pb.RaftClient, followers []*follower, envVars env) *server {
 	srv := &server{
 		logger:        logger,
 		followers:     followers,
@@ -100,8 +101,12 @@ func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteRespo
 	}
 	s.entries = append(s.entries, entry)
 	s.logger.Info("appended uncommitted entry", slog.Any("entry", entry))
-	s.logger.Info("calling append entries")
-	_, err := s.AppendEntries(ctx, &pb.AppendEntriesRequest{})
+
+	_, err := s.AppendEntries(ctx, &pb.AppendEntriesRequest{
+		Term:     int32(s.term),
+		LeaderId: "",
+		Entries:  []*pb.LogEntry{entry},
+	})
 	if err != nil {
 		s.logger.Error("failed to append entries", slog.Any("err", err))
 		return nil, err
@@ -130,40 +135,69 @@ func (s *server) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest)
 			}
 		}
 
+		s.logger.Info("appended entries in follower")
 		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
 	}
 }
 
 func (s *server) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) error {
-	for idx, conn := range s.followers {
-		entries := s.entries[conn.nextIndex:]
-		prevIndex := max(0, conn.nextIndex-1)
-		var prevTerm int32 = 0
-		if prevIndex > 0 {
-			prevTerm = s.entries[prevIndex].Term
-		}
-		resp, err := conn.client.AppendEntries(ctx, &pb.AppendEntriesRequest{
-			Term:         int32(s.term),
-			LeaderId:     "",
-			PrevLogIndex: int32(prevIndex),
-			PrevLogTerm:  prevTerm,
-			Entries:      entries,
-			LeaderCommit: int32(s.commitIndex),
-		})
-		if err != nil {
-			return err
-		}
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	doneCh := make(chan struct{})
+	for _, conn := range s.followers {
+		go s.followerAppendEntries(ctx, conn, in, doneCh)
+	}
 
-		if resp.Success {
-			s.followers[idx].nextIndex = conn.nextIndex + len(entries)
-			for _, entry := range entries {
-				key, val := parseCommand(entry)
-				s.committedVals[key] = val
-				s.logger.Info("committed entry", slog.Any("entry", entry))
-				in.LeaderCommit++
-			}
+	go waitForDone(doneCh, wg)
+
+	wg.Wait()
+
+	for _, entry := range in.Entries {
+		key, val := parseCommand(entry)
+		s.committedVals[key] = val
+		s.logger.Info("committed entry", slog.Any("entry", entry))
+		in.LeaderCommit++
+	}
+	return nil
+}
+
+func waitForDone(doneCh chan struct{}, wg *sync.WaitGroup) {
+	i := 0
+	for range doneCh {
+		i += 1
+		if i == 1 {
+			wg.Done()
+		}
+		if i == 2 {
+			break
 		}
 	}
+	close(doneCh)
+}
+
+func (s *server) followerAppendEntries(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest, doneCh chan struct{}) error {
+	prevIndex := max(0, conn.nextIndex-1)
+	var prevTerm int32 = 0
+	if prevIndex > 0 {
+		prevTerm = s.entries[prevIndex].Term
+	}
+	resp, err := conn.client.AppendEntries(ctx, &pb.AppendEntriesRequest{
+		Term:         int32(s.term),
+		LeaderId:     "",
+		PrevLogIndex: int32(prevIndex),
+		PrevLogTerm:  prevTerm,
+		Entries:      in.Entries,
+		LeaderCommit: int32(s.commitIndex),
+	})
+	if err != nil {
+		return err
+	}
+
+	if resp.Success {
+		conn.nextIndex = conn.nextIndex + len(in.Entries)
+	}
+
+	doneCh <- struct{}{}
 	return nil
 }
 

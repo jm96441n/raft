@@ -86,14 +86,14 @@ func createLeaderConn(envVars env) (pb.RaftClient, error) {
 	return pb.NewRaftClient(conn), nil
 }
 
-func createFollowerConns(envVars env) ([]follower, error) {
-	var conns []follower
+func createFollowerConns(envVars env) ([]*follower, error) {
+	var conns []*follower
 	for _, addr := range envVars.serverAddrs {
 		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			return nil, err
 		}
-		follower := follower{
+		follower := &follower{
 			client:    pb.NewRaftClient(conn),
 			nextIndex: 0,
 		}
