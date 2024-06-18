@@ -27,7 +27,7 @@ type server struct {
 	IsLeader   bool
 
 	// on all
-	entries         []*pb.LogEntry
+	entries         logStore
 	committedVals   map[int]string
 	term            int
 	commitIndex     int
@@ -42,28 +42,36 @@ type follower struct {
 	nextIndex int
 }
 
-func NewServer(logger *slog.Logger, leaderAddr string, followerAddrs []string, isLeader bool) (*server, error) {
-	leader, err := createLeaderConn(leaderAddr)
+type ServerConfig struct {
+	Logger        *slog.Logger
+	LeaderAddr    string
+	FollowerAddrs []string
+	IsLeader      bool
+	LogStore      logStore
+}
+
+func NewServer(cfg ServerConfig) (*server, error) {
+	leader, err := createLeaderConn(cfg.LeaderAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	followers, err := createFollowerConns(followerAddrs)
+	followers, err := createFollowerConns(cfg.FollowerAddrs)
 	if err != nil {
 		return nil, err
 	}
 
 	srv := &server{
-		logger:        logger,
+		logger:        cfg.Logger,
 		followers:     followers,
 		leaderAddr:    leader,
 		committedVals: make(map[int]string),
-		entries:       []*pb.LogEntry{},
+		entries:       cfg.LogStore,
 		term:          0,
 	}
 
 	// handle actual leader election later
-	if isLeader {
+	if cfg.IsLeader {
 		sleepTime := rand.IntN((maxHeartbeat+1)-minHeartbeat) + minHeartbeat
 		ticker := time.NewTicker(time.Duration(sleepTime) * time.Millisecond)
 		srv.IsLeader = true
@@ -139,9 +147,9 @@ func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteRespo
 	entry := &pb.LogEntry{
 		Term:    int32(s.term),
 		Command: fmt.Sprintf("%d:%s", in.Key, in.Value),
-		Index:   int64(len(s.entries) + 1),
+		Index:   int64(s.entries.NextIndex()),
 	}
-	s.entries = append(s.entries, entry)
+	s.entries.Append(entry)
 	s.logger.Info("appended uncommitted entry", slog.Any("entry", entry))
 
 	_, err := s.AppendEntries(ctx, &pb.AppendEntriesRequest{
@@ -167,14 +175,19 @@ func (s *server) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest)
 
 		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
 	} else {
-		s.entries = append(s.entries, in.Entries...)
+		s.entries.Append(in.Entries...)
+		if len(in.Entries) != 0 {
+			s.logger.Info("appended uncommitted entries in follower", slog.Any("entries", in.Entries))
+		}
 
 		if in.LeaderCommit > int64(s.commitIndex) {
 			for i := s.commitIndex; i < int(in.LeaderCommit); i++ {
-				key, val := parseCommand(s.entries[i])
+				entry := s.entries.Get(i)
+				s.logger.Info("entry to commit", slog.Any("entry", entry))
+				key, val := parseCommand(entry)
 				s.committedVals[key] = val
-				s.commitIndex = int(s.entries[i].Index)
-				s.logger.Info("committed entry", slog.Any("entry", s.entries[i]))
+				s.commitIndex = int(entry.Index)
+				s.logger.Info("committed entry", slog.Any("entry", entry))
 			}
 		}
 
@@ -185,6 +198,7 @@ func (s *server) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest)
 func (s *server) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) error {
 	threshold := New(len(s.followers) / 2)
 	for _, conn := range s.followers {
+		conn := conn
 		threshold.Go(s.replicateToFollowers(ctx, conn, in))
 	}
 
@@ -203,13 +217,13 @@ func (s *server) replicateToFollowers(ctx context.Context, conn *follower, in *p
 	return func() {
 		entries := []*pb.LogEntry{}
 		if len(in.Entries) != 0 {
-			entries = s.entries[conn.nextIndex:in.Entries[len(in.Entries)-1].Index]
+			entries = s.entries.GetRange(conn.nextIndex, int(in.Entries[len(in.Entries)-1].Index))
 			s.logger.Info("entries replicated", slog.Any("entries", entries))
 		}
 		prevIndex := max(0, conn.nextIndex-1)
 		var prevTerm int32 = 0
 		if prevIndex > 0 {
-			prevTerm = s.entries[prevIndex].Term
+			prevTerm = s.entries.Get(prevIndex).Term
 		}
 		resp, err := conn.client.AppendEntries(ctx, &pb.AppendEntriesRequest{
 			Term:         int32(s.term),
@@ -221,6 +235,7 @@ func (s *server) replicateToFollowers(ctx context.Context, conn *follower, in *p
 		})
 		if err != nil {
 			s.logger.Error("failed to append entries", slog.Any("err", err), slog.Any("conn Addr", conn.client))
+			return
 		}
 
 		if resp.Success && len(in.Entries) != 0 {

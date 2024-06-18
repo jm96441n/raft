@@ -36,7 +36,13 @@ func main() {
 		logger.Error("failed to construct listener on port", slog.Any("err", err), slog.Any("port", envVars.port))
 	}
 
-	srv, err := raft.NewServer(logger, envVars.leaderAddr, envVars.serverAddrs, envVars.port == 8080)
+	srv, err := raft.NewServer(raft.ServerConfig{
+		Logger:        logger,
+		LeaderAddr:    envVars.leaderAddr,
+		FollowerAddrs: envVars.serverAddrs,
+		IsLeader:      envVars.port == 8080,
+		LogStore:      raft.NewInMemStore(),
+	})
 	if err != nil {
 		logger.Error("failed to create server", slog.Any("err", err))
 	}
