@@ -16,6 +16,7 @@ services:
     environment:
       PORT: 8081
       SERVER_ADDRS: server1:8080,server3:8082
+      LEADER_ADDR: server1:8080
   server3:
     build:
       dockerfile: ./Dockerfile
@@ -24,3 +25,4 @@ services:
     environment:
       PORT: 8082
       SERVER_ADDRS: server1:8080,server2:8081
+      LEADER_ADDR: server1:8080

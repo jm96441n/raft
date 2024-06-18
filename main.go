@@ -10,13 +10,13 @@ import (
 	"strings"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
 
 	pb "github.com/jm96441n/raft/gen/go/raft/v1"
+	"github.com/jm96441n/raft/raft"
 )
 
-type env struct {
+type Config struct {
 	port        int
 	serverAddrs []string
 	leaderAddr  string
@@ -36,22 +36,13 @@ func main() {
 		logger.Error("failed to construct listener on port", slog.Any("err", err), slog.Any("port", envVars.port))
 	}
 
-	leaderAddr, err := createLeaderConn(envVars)
+	srv, err := raft.NewServer(logger, envVars.leaderAddr, envVars.serverAddrs, envVars.port == 8080)
 	if err != nil {
-		logger.Error("failed to create leader connection", slog.Any("err", err))
-		os.Exit(1)
+		logger.Error("failed to create server", slog.Any("err", err))
 	}
 
-	followerConns, err := createFollowerConns(envVars)
-	if err != nil {
-		logger.Error("failed to create client connections", slog.Any("err", err))
-		os.Exit(1)
-	}
-
-	srv := NewServer(logger, leaderAddr, followerConns, envVars)
-
-	if srv.isLeader {
-		go heartbeat(context.Background(), srv)
+	if srv.IsLeader {
+		go raft.Heartbeat(context.Background(), srv)
 	}
 
 	s := grpc.NewServer()
@@ -65,39 +56,15 @@ func main() {
 	}
 }
 
-func parseEnvVars() (env, error) {
+func parseEnvVars() (Config, error) {
 	port, err := strconv.Atoi(os.Getenv("PORT"))
 	if err != nil {
-		return env{}, err
+		return Config{}, err
 	}
 
-	return env{
+	return Config{
 		port:        port,
 		leaderAddr:  os.Getenv("LEADER_ADDR"),
 		serverAddrs: strings.Split(os.Getenv("SERVER_ADDRS"), ","),
 	}, nil
-}
-
-func createLeaderConn(envVars env) (pb.RaftClient, error) {
-	conn, err := grpc.NewClient(envVars.leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, err
-	}
-	return pb.NewRaftClient(conn), nil
-}
-
-func createFollowerConns(envVars env) ([]*follower, error) {
-	var conns []*follower
-	for _, addr := range envVars.serverAddrs {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return nil, err
-		}
-		follower := &follower{
-			client:    pb.NewRaftClient(conn),
-			nextIndex: 0,
-		}
-		conns = append(conns, follower)
-	}
-	return conns, nil
 }

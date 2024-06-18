@@ -1,13 +1,20 @@
-package main
+package raft
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sync"
+	"math/rand/v2"
 	"time"
 
 	pb "github.com/jm96441n/raft/gen/go/raft/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+const (
+	maxHeartbeat = 300
+	minHeartbeat = 150
 )
 
 type server struct {
@@ -17,7 +24,7 @@ type server struct {
 	// leader specific
 	followers  []*follower
 	leaderAddr pb.RaftClient
-	isLeader   bool
+	IsLeader   bool
 
 	// on all
 	entries         []*pb.LogEntry
@@ -26,40 +33,79 @@ type server struct {
 	commitIndex     int
 	lastApplied     int
 	heartbeatTicker *time.Ticker
+	heartbeatTime   time.Duration
 }
 
 type follower struct {
 	client    pb.RaftClient
+	addr      string
 	nextIndex int
 }
 
-func NewServer(logger *slog.Logger, leaderAddr pb.RaftClient, followers []*follower, envVars env) *server {
+func NewServer(logger *slog.Logger, leaderAddr string, followerAddrs []string, isLeader bool) (*server, error) {
+	leader, err := createLeaderConn(leaderAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	followers, err := createFollowerConns(followerAddrs)
+	if err != nil {
+		return nil, err
+	}
+
 	srv := &server{
 		logger:        logger,
 		followers:     followers,
-		leaderAddr:    leaderAddr,
+		leaderAddr:    leader,
 		committedVals: make(map[int]string),
 		entries:       []*pb.LogEntry{},
 		term:          0,
 	}
 
 	// handle actual leader election later
-	if envVars.port == 8080 {
-		ticker := time.NewTicker(300 * time.Millisecond)
-		srv.isLeader = true
+	if isLeader {
+		sleepTime := rand.IntN((maxHeartbeat+1)-minHeartbeat) + minHeartbeat
+		ticker := time.NewTicker(time.Duration(sleepTime) * time.Millisecond)
+		srv.IsLeader = true
+		srv.heartbeatTime = time.Duration(sleepTime) * time.Millisecond
 		srv.heartbeatTicker = ticker
 	}
 
-	return srv
+	return srv, nil
 }
 
-func heartbeat(ctx context.Context, srv *server) {
+func createLeaderConn(leaderAddr string) (pb.RaftClient, error) {
+	conn, err := grpc.NewClient(leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return nil, err
+	}
+	return pb.NewRaftClient(conn), nil
+}
+
+func createFollowerConns(followerAddrs []string) ([]*follower, error) {
+	var conns []*follower
+	for _, addr := range followerAddrs {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return nil, err
+		}
+		follower := &follower{
+			client:    pb.NewRaftClient(conn),
+			addr:      addr,
+			nextIndex: 0,
+		}
+		conns = append(conns, follower)
+	}
+	return conns, nil
+}
+
+func Heartbeat(ctx context.Context, srv *server) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-srv.heartbeatTicker.C:
-			if srv.isLeader {
+			if srv.IsLeader {
 				_, err := srv.AppendEntries(ctx, &pb.AppendEntriesRequest{})
 				if err != nil {
 					srv.logger.Error("failed to send heartbeat", slog.Any("err", err))
@@ -71,11 +117,6 @@ func heartbeat(ctx context.Context, srv *server) {
 
 func (s *server) Read(ctx context.Context, in *pb.ReadRequest) (*pb.ReadResponse, error) {
 	s.logger.Info("getting value")
-	if !s.isLeader {
-		s.logger.Info("forwarding request to leader")
-		// forward request to leader
-		return s.leaderAddr.Read(ctx, in)
-	}
 
 	val, ok := s.committedVals[int(in.Key)]
 	if !ok {
@@ -87,7 +128,7 @@ func (s *server) Read(ctx context.Context, in *pb.ReadRequest) (*pb.ReadResponse
 
 func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteResponse, error) {
 	s.logger.Info("writing value")
-	if !s.isLeader {
+	if !s.IsLeader {
 		s.logger.Info("forwarding request to leader")
 		// forward request to leader
 		return s.leaderAddr.Write(ctx, in)
@@ -98,6 +139,7 @@ func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteRespo
 	entry := &pb.LogEntry{
 		Term:    int32(s.term),
 		Command: fmt.Sprintf("%d:%s", in.Key, in.Value),
+		Index:   int64(len(s.entries) + 1),
 	}
 	s.entries = append(s.entries, entry)
 	s.logger.Info("appended uncommitted entry", slog.Any("entry", entry))
@@ -111,13 +153,13 @@ func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteRespo
 		s.logger.Error("failed to append entries", slog.Any("err", err))
 		return nil, err
 	}
-	s.heartbeatTicker.Reset(300 * time.Millisecond)
+	s.heartbeatTicker.Reset(s.heartbeatTime)
 	s.logger.Info("appended entries")
 	return &pb.WriteResponse{Success: true}, nil
 }
 
 func (s *server) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	if s.isLeader {
+	if s.IsLeader {
 		err := s.leaderAppendEntries(ctx, in)
 		if err != nil {
 			return &pb.AppendEntriesResponse{Term: int32(s.term), Success: false}, err
@@ -126,79 +168,65 @@ func (s *server) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest)
 		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
 	} else {
 		s.entries = append(s.entries, in.Entries...)
-		if in.LeaderCommit > int32(s.commitIndex) {
-			for i := s.commitIndex + 1; i <= int(in.LeaderCommit); i++ {
+
+		if in.LeaderCommit > int64(s.commitIndex) {
+			for i := s.commitIndex; i < int(in.LeaderCommit); i++ {
 				key, val := parseCommand(s.entries[i])
 				s.committedVals[key] = val
-				s.commitIndex = i
+				s.commitIndex = int(s.entries[i].Index)
 				s.logger.Info("committed entry", slog.Any("entry", s.entries[i]))
 			}
 		}
 
-		s.logger.Info("appended entries in follower")
 		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
 	}
 }
 
 func (s *server) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) error {
-	wg := &sync.WaitGroup{}
-	wg.Add(1)
-	doneCh := make(chan struct{})
+	threshold := New(len(s.followers) / 2)
 	for _, conn := range s.followers {
-		go s.followerAppendEntries(ctx, conn, in, doneCh)
+		threshold.Go(s.replicateToFollowers(ctx, conn, in))
 	}
 
-	go waitForDone(doneCh, wg)
-
-	wg.Wait()
+	threshold.Wait()
 
 	for _, entry := range in.Entries {
 		key, val := parseCommand(entry)
 		s.committedVals[key] = val
 		s.logger.Info("committed entry", slog.Any("entry", entry))
-		in.LeaderCommit++
+		s.commitIndex = int(entry.Index)
 	}
 	return nil
 }
 
-func waitForDone(doneCh chan struct{}, wg *sync.WaitGroup) {
-	i := 0
-	for range doneCh {
-		i += 1
-		if i == 1 {
-			wg.Done()
+func (s *server) replicateToFollowers(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest) func() {
+	return func() {
+		entries := []*pb.LogEntry{}
+		if len(in.Entries) != 0 {
+			entries = s.entries[conn.nextIndex:in.Entries[len(in.Entries)-1].Index]
+			s.logger.Info("entries replicated", slog.Any("entries", entries))
 		}
-		if i == 2 {
-			break
+		prevIndex := max(0, conn.nextIndex-1)
+		var prevTerm int32 = 0
+		if prevIndex > 0 {
+			prevTerm = s.entries[prevIndex].Term
+		}
+		resp, err := conn.client.AppendEntries(ctx, &pb.AppendEntriesRequest{
+			Term:         int32(s.term),
+			LeaderId:     "",
+			PrevLogIndex: int64(prevIndex),
+			PrevLogTerm:  prevTerm,
+			Entries:      entries,
+			LeaderCommit: int64(s.commitIndex),
+		})
+		if err != nil {
+			s.logger.Error("failed to append entries", slog.Any("err", err), slog.Any("conn Addr", conn.client))
+		}
+
+		if resp.Success && len(in.Entries) != 0 {
+			conn.nextIndex = int(in.Entries[len(in.Entries)-1].Index)
 		}
 	}
-	close(doneCh)
-}
-
-func (s *server) followerAppendEntries(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest, doneCh chan struct{}) error {
-	prevIndex := max(0, conn.nextIndex-1)
-	var prevTerm int32 = 0
-	if prevIndex > 0 {
-		prevTerm = s.entries[prevIndex].Term
-	}
-	resp, err := conn.client.AppendEntries(ctx, &pb.AppendEntriesRequest{
-		Term:         int32(s.term),
-		LeaderId:     "",
-		PrevLogIndex: int32(prevIndex),
-		PrevLogTerm:  prevTerm,
-		Entries:      in.Entries,
-		LeaderCommit: int32(s.commitIndex),
-	})
-	if err != nil {
-		return err
-	}
-
-	if resp.Success {
-		conn.nextIndex = conn.nextIndex + len(in.Entries)
-	}
-
-	doneCh <- struct{}{}
-	return nil
 }
 
 func parseCommand(entry *pb.LogEntry) (int, string) {
