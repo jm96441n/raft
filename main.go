@@ -36,7 +36,7 @@ func main() {
 		logger.Error("failed to construct listener on port", slog.Any("err", err), slog.Any("port", envVars.port))
 	}
 
-	srv, err := raft.NewNode(raft.NodeConfig{
+	node, err := raft.NewNode(raft.NodeConfig{
 		Logger:        logger,
 		LeaderAddr:    envVars.leaderAddr,
 		FollowerAddrs: envVars.serverAddrs,
@@ -47,12 +47,10 @@ func main() {
 		logger.Error("failed to create server", slog.Any("err", err))
 	}
 
-	if srv.IsLeader {
-		go raft.Heartbeat(context.Background(), srv)
-	}
+	go node.Run(context.Background())
 
 	s := grpc.NewServer()
-	pb.RegisterRaftServer(s, srv)
+	pb.RegisterRaftServer(s, node)
 	reflection.Register(s)
 
 	logger.Info("server listening", slog.Any("addr", listener.Addr().String()))

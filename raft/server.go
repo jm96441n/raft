@@ -17,6 +17,14 @@ const (
 	minHeartbeat = 150
 )
 
+type nodeState int
+
+const (
+	LEADER nodeState = iota
+	FOLLOWER
+	CANDIDATE
+)
+
 type node struct {
 	pb.UnimplementedRaftServer
 	logger *slog.Logger
@@ -24,7 +32,7 @@ type node struct {
 	// leader specific
 	followers  []*follower
 	leaderAddr pb.RaftClient
-	IsLeader   bool
+	state      nodeState
 
 	// on all
 	entries         logStore
@@ -62,7 +70,7 @@ func NewNode(cfg NodeConfig) (*node, error) {
 		return nil, err
 	}
 
-	srv := &node{
+	node := &node{
 		logger:        cfg.Logger,
 		followers:     followers,
 		leaderAddr:    leader,
@@ -75,12 +83,35 @@ func NewNode(cfg NodeConfig) (*node, error) {
 	if cfg.IsLeader {
 		sleepTime := rand.IntN((maxHeartbeat+1)-minHeartbeat) + minHeartbeat
 		ticker := time.NewTicker(time.Duration(sleepTime) * time.Millisecond)
-		srv.IsLeader = true
-		srv.heartbeatTime = time.Duration(sleepTime) * time.Millisecond
-		srv.heartbeatTicker = ticker
+		node.state = LEADER
+		node.heartbeatTime = time.Duration(sleepTime) * time.Millisecond
+		node.heartbeatTicker = ticker
+	} else {
+		node.state = FOLLOWER
 	}
 
-	return srv, nil
+	return node, nil
+}
+
+func (n *node) IsLeader() bool {
+	return n.state == LEADER
+}
+
+func (n *node) IsFollower() bool {
+	return n.state == FOLLOWER
+}
+
+func (n *node) IsCandidate() bool {
+	return n.state == CANDIDATE
+}
+
+func (n *node) Run(ctx context.Context) {
+	switch n.state {
+	case LEADER:
+		Heartbeat(ctx, n)
+	case FOLLOWER:
+	case CANDIDATE:
+	}
 }
 
 func createLeaderConn(leaderAddr string) (pb.RaftClient, error) {
@@ -114,121 +145,119 @@ func Heartbeat(ctx context.Context, srv *node) {
 		case <-ctx.Done():
 			return
 		case <-srv.heartbeatTicker.C:
-			if srv.IsLeader {
-				_, err := srv.AppendEntries(ctx, &pb.AppendEntriesRequest{})
-				if err != nil {
-					srv.logger.Error("failed to send heartbeat", slog.Any("err", err))
-				}
+			_, err := srv.AppendEntries(ctx, &pb.AppendEntriesRequest{})
+			if err != nil {
+				srv.logger.Error("failed to send heartbeat", slog.Any("err", err))
 			}
 		}
 	}
 }
 
-func (s *node) Read(ctx context.Context, in *pb.ReadRequest) (*pb.ReadResponse, error) {
-	s.logger.Info("getting value")
+func (n *node) Read(ctx context.Context, in *pb.ReadRequest) (*pb.ReadResponse, error) {
+	n.logger.Info("getting value")
 
-	val, ok := s.committedVals[int(in.Key)]
+	val, ok := n.committedVals[int(in.Key)]
 	if !ok {
 		return &pb.ReadResponse{}, nil
 	}
-	s.logger.Info("got value", slog.Any("val", val), slog.Any("key", in.Key))
+	n.logger.Info("got value", slog.Any("val", val), slog.Any("key", in.Key))
 	return &pb.ReadResponse{Value: val}, nil
 }
 
-func (s *node) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteResponse, error) {
-	s.logger.Info("writing value")
-	if !s.IsLeader {
-		s.logger.Info("forwarding request to leader")
+func (n *node) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteResponse, error) {
+	n.logger.Info("writing value")
+	if !n.IsLeader() {
+		n.logger.Info("forwarding request to leader")
 		// forward request to leader
-		return s.leaderAddr.Write(ctx, in)
+		return n.leaderAddr.Write(ctx, in)
 	}
 
-	s.logger.Info("input", slog.Any("key", in.Key), slog.Any("value", in.Value))
+	n.logger.Info("input", slog.Any("key", in.Key), slog.Any("value", in.Value))
 
 	entry := &pb.LogEntry{
-		Term:    int32(s.term),
+		Term:    int32(n.term),
 		Command: fmt.Sprintf("%d:%s", in.Key, in.Value),
-		Index:   int64(s.entries.NextIndex()),
+		Index:   int64(n.entries.NextIndex()),
 	}
 
-	_, err := s.AppendEntries(ctx, &pb.AppendEntriesRequest{
-		Term:     int32(s.term),
+	_, err := n.AppendEntries(ctx, &pb.AppendEntriesRequest{
+		Term:     int32(n.term),
 		LeaderId: "",
 		Entries:  []*pb.LogEntry{entry},
 	})
 	if err != nil {
-		s.logger.Error("failed to append entries", slog.Any("err", err))
+		n.logger.Error("failed to append entries", slog.Any("err", err))
 		return nil, err
 	}
-	s.heartbeatTicker.Reset(s.heartbeatTime)
-	s.logger.Info("appended entries")
+	n.heartbeatTicker.Reset(n.heartbeatTime)
+	n.logger.Info("appended entries")
 	return &pb.WriteResponse{Success: true}, nil
 }
 
-func (s *node) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+func (n *node) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
 	if ctx.Err() != nil {
-		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: false}, ctx.Err()
+		return &pb.AppendEntriesResponse{Term: int32(n.term), Success: false}, ctx.Err()
 	}
 
-	if s.IsLeader {
-		err := s.leaderAppendEntries(ctx, in)
+	if n.IsLeader() {
+		err := n.leaderAppendEntries(ctx, in)
 		if err != nil {
-			return &pb.AppendEntriesResponse{Term: int32(s.term), Success: false}, err
+			return &pb.AppendEntriesResponse{Term: int32(n.term), Success: false}, err
 		}
 
-		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
+		return &pb.AppendEntriesResponse{Term: int32(n.term), Success: true}, nil
 	}
 
-	s.followerApendEntries(in)
+	n.followerApendEntries(in)
 
-	return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
+	return &pb.AppendEntriesResponse{Term: int32(n.term), Success: true}, nil
 }
 
-func (s *node) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) error {
+func (n *node) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) error {
 	if len(in.Entries) != 0 {
-		s.entries.Append(in.Entries...)
-		s.logger.Info("appended uncommitted entry in leader", slog.Any("entries", in.Entries))
+		n.entries.Append(in.Entries...)
+		n.logger.Info("appended uncommitted entry in leader", slog.Any("entries", in.Entries))
 	}
 
-	threshold := NewThreshold(len(s.followers) / 2)
-	for _, conn := range s.followers {
+	threshold := NewThreshold(len(n.followers) / 2)
+	for _, conn := range n.followers {
 		conn := conn
-		threshold.Go(s.replicateToFollowers(ctx, conn, in))
+		threshold.Go(n.replicateToFollowers(ctx, conn, in))
 	}
 
 	threshold.Wait()
 
 	for _, entry := range in.Entries {
 		key, val := parseCommand(entry)
-		s.committedVals[key] = val
-		s.logger.Info("committed entry", slog.Any("entry", entry))
-		s.commitIndex = int(entry.Index)
+		n.committedVals[key] = val
+		n.logger.Info("committed entry", slog.Any("entry", entry))
+		n.commitIndex = int(entry.Index)
 	}
 	return nil
 }
 
-func (s *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest) func() {
+func (n *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest) func() {
 	return func() {
 		entries := []*pb.LogEntry{}
 		if len(in.Entries) != 0 {
-			entries = s.entries.GetRange(conn.nextIndex, int(in.Entries[len(in.Entries)-1].Index))
-			s.logger.Info("entries replicated", slog.Any("entries", entries))
+			entries = n.entries.GetRange(conn.nextIndex, int(in.Entries[len(in.Entries)-1].Index))
+			n.logger.Info("entries replicated", slog.Any("entries", entries))
 		}
 		prevIndex := max(0, conn.nextIndex-1)
 		var prevTerm int32 = 0
 		if prevIndex > 0 {
-			prevTerm = s.entries.Get(prevIndex).Term
+			prevTerm = n.entries.Get(prevIndex).Term
 		}
 		resp, err := conn.client.AppendEntries(ctx, &pb.AppendEntriesRequest{
-			Term:         int32(s.term),
+			Term:         int32(n.term),
 			LeaderId:     "",
 			PrevLogIndex: int64(prevIndex),
 			PrevLogTerm:  prevTerm,
 			Entries:      entries,
-			LeaderCommit: int64(s.commitIndex),
+			LeaderCommit: int64(n.commitIndex),
 		})
 		if err != nil {
-			s.logger.Error("failed to append entries", slog.Any("err", err), slog.Any("conn Addr", conn.client))
+			n.logger.Error("failed to append entries", slog.Any("err", err), slog.Any("conn Addr", conn.client))
 			return
 		}
 
@@ -239,20 +268,20 @@ func (s *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.
 	}
 }
 
-func (s *node) followerApendEntries(in *pb.AppendEntriesRequest) {
-	s.entries.Append(in.Entries...)
+func (n *node) followerApendEntries(in *pb.AppendEntriesRequest) {
+	n.entries.Append(in.Entries...)
 	if len(in.Entries) != 0 {
-		s.logger.Info("appended uncommitted entries in follower", slog.Any("entries", in.Entries))
+		n.logger.Info("appended uncommitted entries in follower", slog.Any("entries", in.Entries))
 	}
 
-	if in.LeaderCommit > int64(s.commitIndex) {
-		for i := s.commitIndex; i < int(in.LeaderCommit); i++ {
-			entry := s.entries.Get(i)
-			s.logger.Info("entry to commit", slog.Any("entry", entry))
+	if in.LeaderCommit > int64(n.commitIndex) {
+		for i := n.commitIndex; i < int(in.LeaderCommit); i++ {
+			entry := n.entries.Get(i)
+			n.logger.Info("entry to commit", slog.Any("entry", entry))
 			key, val := parseCommand(entry)
-			s.committedVals[key] = val
-			s.commitIndex = int(entry.Index)
-			s.logger.Info("committed entry", slog.Any("entry", entry))
+			n.committedVals[key] = val
+			n.commitIndex = int(entry.Index)
+			n.logger.Info("committed entry", slog.Any("entry", entry))
 		}
 	}
 }
@@ -268,7 +297,7 @@ func parseCommand(entry *pb.LogEntry) (int, string) {
 	return key, val
 }
 
-func (s *node) RequestVote(ctx context.Context, in *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	s.logger.Info("requesting vote")
+func (n *node) RequestVote(ctx context.Context, in *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	n.logger.Info("requesting vote")
 	return &pb.RequestVoteResponse{}, nil
 }
