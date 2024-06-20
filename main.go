@@ -36,7 +36,7 @@ func main() {
 		logger.Error("failed to construct listener on port", slog.Any("err", err), slog.Any("port", envVars.port))
 	}
 
-	srv, err := raft.NewServer(raft.ServerConfig{
+	srv, err := raft.NewNode(raft.NodeConfig{
 		Logger:        logger,
 		LeaderAddr:    envVars.leaderAddr,
 		FollowerAddrs: envVars.serverAddrs,

@@ -7,7 +7,7 @@ type Threshold struct {
 	threshold atomic.Int32
 }
 
-func New(threshold int) *Threshold {
+func NewThreshold(threshold int) *Threshold {
 	t := &Threshold{
 		wait: make(chan struct{}),
 	}

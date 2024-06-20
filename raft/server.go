@@ -17,7 +17,7 @@ const (
 	minHeartbeat = 150
 )
 
-type server struct {
+type node struct {
 	pb.UnimplementedRaftServer
 	logger *slog.Logger
 
@@ -42,7 +42,7 @@ type follower struct {
 	nextIndex int
 }
 
-type ServerConfig struct {
+type NodeConfig struct {
 	Logger        *slog.Logger
 	LeaderAddr    string
 	FollowerAddrs []string
@@ -50,7 +50,7 @@ type ServerConfig struct {
 	LogStore      logStore
 }
 
-func NewServer(cfg ServerConfig) (*server, error) {
+func NewNode(cfg NodeConfig) (*node, error) {
 	leader, err := createLeaderConn(cfg.LeaderAddr)
 	if err != nil {
 		return nil, err
@@ -61,7 +61,7 @@ func NewServer(cfg ServerConfig) (*server, error) {
 		return nil, err
 	}
 
-	srv := &server{
+	srv := &node{
 		logger:        cfg.Logger,
 		followers:     followers,
 		leaderAddr:    leader,
@@ -107,7 +107,7 @@ func createFollowerConns(followerAddrs []string) ([]*follower, error) {
 	return conns, nil
 }
 
-func Heartbeat(ctx context.Context, srv *server) {
+func Heartbeat(ctx context.Context, srv *node) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -123,7 +123,7 @@ func Heartbeat(ctx context.Context, srv *server) {
 	}
 }
 
-func (s *server) Read(ctx context.Context, in *pb.ReadRequest) (*pb.ReadResponse, error) {
+func (s *node) Read(ctx context.Context, in *pb.ReadRequest) (*pb.ReadResponse, error) {
 	s.logger.Info("getting value")
 
 	val, ok := s.committedVals[int(in.Key)]
@@ -134,7 +134,7 @@ func (s *server) Read(ctx context.Context, in *pb.ReadRequest) (*pb.ReadResponse
 	return &pb.ReadResponse{Value: val}, nil
 }
 
-func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteResponse, error) {
+func (s *node) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteResponse, error) {
 	s.logger.Info("writing value")
 	if !s.IsLeader {
 		s.logger.Info("forwarding request to leader")
@@ -149,8 +149,6 @@ func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteRespo
 		Command: fmt.Sprintf("%d:%s", in.Key, in.Value),
 		Index:   int64(s.entries.NextIndex()),
 	}
-	s.entries.Append(entry)
-	s.logger.Info("appended uncommitted entry", slog.Any("entry", entry))
 
 	_, err := s.AppendEntries(ctx, &pb.AppendEntriesRequest{
 		Term:     int32(s.term),
@@ -166,7 +164,11 @@ func (s *server) Write(ctx context.Context, in *pb.WriteRequest) (*pb.WriteRespo
 	return &pb.WriteResponse{Success: true}, nil
 }
 
-func (s *server) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+func (s *node) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	if ctx.Err() != nil {
+		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: false}, ctx.Err()
+	}
+
 	if s.IsLeader {
 		err := s.leaderAppendEntries(ctx, in)
 		if err != nil {
@@ -174,29 +176,20 @@ func (s *server) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest)
 		}
 
 		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
-	} else {
-		s.entries.Append(in.Entries...)
-		if len(in.Entries) != 0 {
-			s.logger.Info("appended uncommitted entries in follower", slog.Any("entries", in.Entries))
-		}
-
-		if in.LeaderCommit > int64(s.commitIndex) {
-			for i := s.commitIndex; i < int(in.LeaderCommit); i++ {
-				entry := s.entries.Get(i)
-				s.logger.Info("entry to commit", slog.Any("entry", entry))
-				key, val := parseCommand(entry)
-				s.committedVals[key] = val
-				s.commitIndex = int(entry.Index)
-				s.logger.Info("committed entry", slog.Any("entry", entry))
-			}
-		}
-
-		return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
 	}
+
+	s.followerApendEntries(in)
+
+	return &pb.AppendEntriesResponse{Term: int32(s.term), Success: true}, nil
 }
 
-func (s *server) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) error {
-	threshold := New(len(s.followers) / 2)
+func (s *node) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) error {
+	if len(in.Entries) != 0 {
+		s.entries.Append(in.Entries...)
+		s.logger.Info("appended uncommitted entry in leader", slog.Any("entries", in.Entries))
+	}
+
+	threshold := NewThreshold(len(s.followers) / 2)
 	for _, conn := range s.followers {
 		conn := conn
 		threshold.Go(s.replicateToFollowers(ctx, conn, in))
@@ -213,7 +206,7 @@ func (s *server) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRe
 	return nil
 }
 
-func (s *server) replicateToFollowers(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest) func() {
+func (s *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest) func() {
 	return func() {
 		entries := []*pb.LogEntry{}
 		if len(in.Entries) != 0 {
@@ -244,6 +237,24 @@ func (s *server) replicateToFollowers(ctx context.Context, conn *follower, in *p
 	}
 }
 
+func (s *node) followerApendEntries(in *pb.AppendEntriesRequest) {
+	s.entries.Append(in.Entries...)
+	if len(in.Entries) != 0 {
+		s.logger.Info("appended uncommitted entries in follower", slog.Any("entries", in.Entries))
+	}
+
+	if in.LeaderCommit > int64(s.commitIndex) {
+		for i := s.commitIndex; i < int(in.LeaderCommit); i++ {
+			entry := s.entries.Get(i)
+			s.logger.Info("entry to commit", slog.Any("entry", entry))
+			key, val := parseCommand(entry)
+			s.committedVals[key] = val
+			s.commitIndex = int(entry.Index)
+			s.logger.Info("committed entry", slog.Any("entry", entry))
+		}
+	}
+}
+
 func parseCommand(entry *pb.LogEntry) (int, string) {
 	var (
 		key int
@@ -255,7 +266,7 @@ func parseCommand(entry *pb.LogEntry) (int, string) {
 	return key, val
 }
 
-func (s *server) RequestVote(ctx context.Context, in *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+func (s *node) RequestVote(ctx context.Context, in *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	s.logger.Info("requesting vote")
 	return &pb.RequestVoteResponse{}, nil
 }
