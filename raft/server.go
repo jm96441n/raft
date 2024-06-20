@@ -37,9 +37,10 @@ type node struct {
 }
 
 type follower struct {
-	client    pb.RaftClient
-	addr      string
-	nextIndex int
+	client     pb.RaftClient
+	addr       string
+	nextIndex  int
+	matchIndex int
 }
 
 type NodeConfig struct {
@@ -233,6 +234,7 @@ func (s *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.
 
 		if resp.Success && len(in.Entries) != 0 {
 			conn.nextIndex = int(in.Entries[len(in.Entries)-1].Index)
+			conn.matchIndex = conn.nextIndex
 		}
 	}
 }
