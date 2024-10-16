@@ -37,16 +37,15 @@ func main() {
 	}
 
 	node, err := raft.NewNode(raft.NodeConfig{
-		Logger:        logger,
-		LeaderAddr:    envVars.leaderAddr,
-		FollowerAddrs: envVars.serverAddrs,
-		IsLeader:      envVars.port == 8080,
-		LogStore:      raft.NewInMemStore(),
+		Logger:      logger,
+		ServerAddrs: envVars.serverAddrs,
+		LogStore:    raft.NewInMemStore(),
 	})
 	if err != nil {
 		logger.Error("failed to create server", slog.Any("err", err))
 	}
 
+	logger.Info("running")
 	go node.Run(context.Background())
 
 	s := grpc.NewServer()

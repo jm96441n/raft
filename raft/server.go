@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"time"
 
 	pb "github.com/jm96441n/raft/gen/go/raft/v1"
@@ -20,8 +21,8 @@ const (
 type nodeState int
 
 const (
-	LEADER nodeState = iota
-	FOLLOWER
+	FOLLOWER nodeState = iota
+	LEADER
 	CANDIDATE
 )
 
@@ -30,21 +31,25 @@ type node struct {
 	logger *slog.Logger
 
 	// leader specific
-	followers  []*follower
+	servers map[string]*server
+
 	leaderAddr pb.RaftClient
 	state      nodeState
 
 	// on all
-	entries         logStore
-	committedVals   map[int]string
-	term            int
-	commitIndex     int
-	lastApplied     int
+	id            string
+	entries       logStore
+	committedVals map[int]string
+	term          int
+	commitIndex   int
+	lastApplied   int
+
 	heartbeatTicker *time.Ticker
 	heartbeatTime   time.Duration
+	votedFor        string
 }
 
-type follower struct {
+type server struct {
 	client     pb.RaftClient
 	addr       string
 	nextIndex  int
@@ -52,43 +57,35 @@ type follower struct {
 }
 
 type NodeConfig struct {
-	Logger        *slog.Logger
-	LeaderAddr    string
-	FollowerAddrs []string
-	IsLeader      bool
-	LogStore      logStore
+	Logger      *slog.Logger
+	Addr        string
+	ServerAddrs []string
+	IsLeader    bool
+	LogStore    logStore
 }
 
 func NewNode(cfg NodeConfig) (*node, error) {
-	leader, err := createLeaderConn(cfg.LeaderAddr)
+	servers, err := createServerConns(cfg.ServerAddrs)
 	if err != nil {
 		return nil, err
 	}
 
-	followers, err := createFollowerConns(cfg.FollowerAddrs)
-	if err != nil {
-		return nil, err
-	}
+	id, _, _ := strings.Cut(cfg.Addr, ":")
 
 	node := &node{
 		logger:        cfg.Logger,
-		followers:     followers,
-		leaderAddr:    leader,
+		servers:       servers,
 		committedVals: make(map[int]string),
 		entries:       cfg.LogStore,
+		id:            id,
 		term:          0,
 	}
 
 	// handle actual leader election later
-	if cfg.IsLeader {
-		sleepTime := rand.IntN((maxHeartbeat+1)-minHeartbeat) + minHeartbeat
-		ticker := time.NewTicker(time.Duration(sleepTime) * time.Millisecond)
-		node.state = LEADER
-		node.heartbeatTime = time.Duration(sleepTime) * time.Millisecond
-		node.heartbeatTicker = ticker
-	} else {
-		node.state = FOLLOWER
-	}
+	heartbeatTime := rand.IntN((maxHeartbeat+1)-minHeartbeat) + minHeartbeat
+	heartbeatTimer := time.NewTicker(time.Duration(heartbeatTime) * time.Millisecond)
+	node.heartbeatTime = time.Duration(heartbeatTime) * time.Millisecond
+	node.heartbeatTicker = heartbeatTimer
 
 	return node, nil
 }
@@ -97,59 +94,64 @@ func (n *node) IsLeader() bool {
 	return n.state == LEADER
 }
 
-func (n *node) IsFollower() bool {
-	return n.state == FOLLOWER
-}
-
-func (n *node) IsCandidate() bool {
-	return n.state == CANDIDATE
-}
-
 func (n *node) Run(ctx context.Context) {
-	switch n.state {
-	case LEADER:
-		Heartbeat(ctx, n)
-	case FOLLOWER:
-	case CANDIDATE:
-	}
-}
-
-func createLeaderConn(leaderAddr string) (pb.RaftClient, error) {
-	conn, err := grpc.NewClient(leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, err
-	}
-	return pb.NewRaftClient(conn), nil
-}
-
-func createFollowerConns(followerAddrs []string) ([]*follower, error) {
-	var conns []*follower
-	for _, addr := range followerAddrs {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			return nil, err
-		}
-		follower := &follower{
-			client:    pb.NewRaftClient(conn),
-			addr:      addr,
-			nextIndex: 0,
-		}
-		conns = append(conns, follower)
-	}
-	return conns, nil
-}
-
-func Heartbeat(ctx context.Context, srv *node) {
+	n.logger.Info("running node")
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-srv.heartbeatTicker.C:
-			_, err := srv.AppendEntries(ctx, &pb.AppendEntriesRequest{})
-			if err != nil {
-				srv.logger.Error("failed to send heartbeat", slog.Any("err", err))
+		case <-n.heartbeatTicker.C:
+			switch n.state {
+			case LEADER:
+				n.Heartbeat(ctx)
+			default:
+				n.logger.Info("getting votes")
+				n.getVotes(ctx)
 			}
 		}
+	}
+}
+
+func (n *node) getVotes(ctx context.Context) {
+	n.logger.Info("getting votes")
+	if n.votedFor != "" {
+		return
+	}
+
+	n.logger.Info("has not voted yet")
+	threshold := NewThreshold(len(n.servers) / 2)
+	for _, conn := range n.servers {
+		threshold.Go(func() {
+			conn.client.RequestVote(ctx, &pb.RequestVoteRequest{CandidateId: n.id})
+		})
+	}
+	threshold.Wait()
+	n.state = LEADER
+	n.leaderAppendEntries(ctx, &pb.AppendEntriesRequest{})
+}
+
+func createServerConns(serverAddrs []string) (map[string]*server, error) {
+	conns := make(map[string]*server, len(serverAddrs))
+	for _, addr := range serverAddrs {
+		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return nil, err
+		}
+		server := &server{
+			client:    pb.NewRaftClient(conn),
+			addr:      addr,
+			nextIndex: 0,
+		}
+		id, _, _ := strings.Cut(addr, ":")
+		conns[id] = server
+	}
+	return conns, nil
+}
+
+func (srv *node) Heartbeat(ctx context.Context) {
+	_, err := srv.AppendEntries(ctx, &pb.AppendEntriesRequest{})
+	if err != nil {
+		srv.logger.Error("failed to send heartbeat", slog.Any("err", err))
 	}
 }
 
@@ -199,6 +201,12 @@ func (n *node) AppendEntries(ctx context.Context, in *pb.AppendEntriesRequest) (
 		return &pb.AppendEntriesResponse{Term: int32(n.term), Success: false}, ctx.Err()
 	}
 
+	if n.votedFor != "" && !n.IsLeader() {
+		n.state = FOLLOWER
+		n.leaderAddr = n.servers[n.votedFor].client
+		n.votedFor = ""
+	}
+
 	if n.IsLeader() {
 		err := n.leaderAppendEntries(ctx, in)
 		if err != nil {
@@ -219,8 +227,8 @@ func (n *node) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequ
 		n.logger.Info("appended uncommitted entry in leader", slog.Any("entries", in.Entries))
 	}
 
-	threshold := NewThreshold(len(n.followers) / 2)
-	for _, conn := range n.followers {
+	threshold := NewThreshold(len(n.servers) / 2)
+	for _, conn := range n.servers {
 		conn := conn
 		threshold.Go(n.replicateToFollowers(ctx, conn, in))
 	}
@@ -236,7 +244,7 @@ func (n *node) leaderAppendEntries(ctx context.Context, in *pb.AppendEntriesRequ
 	return nil
 }
 
-func (n *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.AppendEntriesRequest) func() {
+func (n *node) replicateToFollowers(ctx context.Context, conn *server, in *pb.AppendEntriesRequest) func() {
 	return func() {
 		entries := []*pb.LogEntry{}
 		if len(in.Entries) != 0 {
@@ -257,6 +265,7 @@ func (n *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.
 			LeaderCommit: int64(n.commitIndex),
 		})
 		if err != nil {
+			panic(err)
 			n.logger.Error("failed to append entries", slog.Any("err", err), slog.Any("conn Addr", conn.client))
 			return
 		}
@@ -269,6 +278,7 @@ func (n *node) replicateToFollowers(ctx context.Context, conn *follower, in *pb.
 }
 
 func (n *node) followerApendEntries(in *pb.AppendEntriesRequest) {
+	n.heartbeatTicker.Reset(n.heartbeatTime)
 	n.entries.Append(in.Entries...)
 	if len(in.Entries) != 0 {
 		n.logger.Info("appended uncommitted entries in follower", slog.Any("entries", in.Entries))
@@ -298,6 +308,10 @@ func parseCommand(entry *pb.LogEntry) (int, string) {
 }
 
 func (n *node) RequestVote(ctx context.Context, in *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	n.logger.Info("requesting vote")
-	return &pb.RequestVoteResponse{}, nil
+	if n.votedFor == "" {
+		n.votedFor = in.CandidateId
+		return &pb.RequestVoteResponse{VoteGranted: true}, nil
+	}
+
+	return &pb.RequestVoteResponse{VoteGranted: false}, nil
 }
